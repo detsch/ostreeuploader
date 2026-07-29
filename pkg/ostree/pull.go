@@ -9,7 +9,32 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
+
+// PullPhase identifies which stage of a pull is running.
+type PullPhase string
+
+const (
+	PhaseMetadata PullPhase = "metadata" // commit/dirtree/dirmeta objects
+	PhaseContent  PullPhase = "content"  // .filez content objects (full pull)
+	PhaseDelta    PullPhase = "delta"    // static-delta parts
+)
+
+// PullProgress is a snapshot of pull progress. ObjectsDone counts whole objects
+// completed in the current phase; ObjectsTotal is the total to fetch in that
+// phase (0 when unknown). BytesDownloaded is cumulative over the wire this run.
+type PullProgress struct {
+	Phase           PullPhase
+	ObjectsDone     int
+	ObjectsTotal    int
+	BytesDownloaded uint64
+	Commit          string
+}
+
+// ProgressFunc receives progress snapshots. It may be called concurrently and
+// frequently, so implementations must be cheap and non-blocking. Optional.
+type ProgressFunc func(PullProgress)
 
 // PullOptions configures a pull. Exactly one of Commit or Ref identifies what to
 // fetch; if both are empty Pull fails. When Ref is given, it is resolved against
@@ -27,6 +52,9 @@ type PullOptions struct {
 	NoDelta bool
 	// Concurrency bounds parallel content-object downloads (default 4).
 	Concurrency int
+	// Progress, if set, receives progress snapshots during the pull. Optional;
+	// nil means no reporting.
+	Progress ProgressFunc
 }
 
 // PullResult reports what a pull did.
@@ -46,6 +74,74 @@ type fetcher struct {
 
 	mu    sync.Mutex
 	stats PullResult
+
+	// progress reporting (all read/written under mu)
+	progress     ProgressFunc // optional
+	curPhase     PullPhase    // phase attributed to progress events
+	contentTotal int          // total objects in the current phase (0 if unknown)
+	contentDone  int          // content/delta objects completed (fetched or already present)
+	lastEmit     time.Time    // last throttled byte-progress emission
+}
+
+// emit reports the current progress snapshot to the callback. Caller must NOT
+// hold f.mu; it snapshots under the lock and calls the callback outside it.
+func (f *fetcher) emit() {
+	f.mu.Lock()
+	if f.progress == nil {
+		f.mu.Unlock()
+		return
+	}
+	p := PullProgress{
+		Phase:           f.curPhase,
+		ObjectsDone:     f.contentDoneLocked(),
+		ObjectsTotal:    f.contentTotal,
+		BytesDownloaded: f.stats.BytesDownloaded,
+		Commit:          f.stats.Commit,
+	}
+	cb := f.progress
+	f.mu.Unlock()
+	cb(p)
+}
+
+// contentDoneLocked returns how many objects count as completed in the current
+// phase. Caller must hold f.mu. For metadata it is metadata objects fetched;
+// for content/delta it is content objects completed (fetched or already present).
+func (f *fetcher) contentDoneLocked() int {
+	if f.curPhase == PhaseMetadata {
+		return f.stats.MetaFetched
+	}
+	return f.contentDone
+}
+
+// addBytes adds n bytes (from a content/delta object body) to the running total
+// and emits a throttled snapshot so progress advances within a large object
+// without a callback per read. Content/delta bytes are counted here only (not
+// in addContent), so wrapping the download reader is the single byte source.
+func (f *fetcher) addBytes(n uint64) {
+	f.mu.Lock()
+	f.stats.BytesDownloaded += n
+	emit := f.progress != nil && time.Since(f.lastEmit) >= 100*time.Millisecond
+	if emit {
+		f.lastEmit = time.Now()
+	}
+	f.mu.Unlock()
+	if emit {
+		f.emit()
+	}
+}
+
+// progressReader wraps a reader to report bytes read to the fetcher.
+type progressReader struct {
+	r io.Reader
+	f *fetcher
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.f.addBytes(uint64(n))
+	}
+	return n, err
 }
 
 // Pull fetches the commit (and every object it references) from the remote
@@ -63,7 +159,7 @@ func (r *Repo) Pull(ctx context.Context, opts PullOptions) (*PullResult, error) 
 	if err != nil {
 		return nil, err
 	}
-	f := &fetcher{t: t, repo: r}
+	f := &fetcher{t: t, repo: r, progress: opts.Progress, curPhase: PhaseMetadata}
 
 	commit := opts.Commit
 	if commit == "" {
@@ -78,6 +174,7 @@ func (r *Repo) Pull(ctx context.Context, opts PullOptions) (*PullResult, error) 
 	if !hexCsumRe.MatchString(commit) {
 		return nil, fmt.Errorf("pull: %q is not a commit checksum", commit)
 	}
+	f.stats.Commit = commit // so progress snapshots carry the commit
 
 	// Mark the commit partial up front; cleared only once every referenced
 	// object is present, so an interrupted pull resumes safely.
@@ -116,7 +213,12 @@ func (r *Repo) Pull(ctx context.Context, opts PullOptions) (*PullResult, error) 
 		if err := f.walkDirTree(ctx, c.RootDirTree, c.RootDirMeta, content); err != nil {
 			return nil, err
 		}
-		// Fetch content objects concurrently (each resumable).
+		// Fetch content objects concurrently (each resumable). The total is known
+		// up front, so progress can report N/M objects.
+		f.mu.Lock()
+		f.curPhase = PhaseContent
+		f.contentTotal = len(content.list())
+		f.mu.Unlock()
 		if err := f.fetchContentObjects(ctx, content.list(), opts.Concurrency); err != nil {
 			return nil, err
 		}
@@ -230,7 +332,7 @@ func (f *fetcher) fetchContentObjects(ctx context.Context, csums []string, concu
 	for _, csum := range csums {
 		csum := csum
 		if f.repo.hasObject(csum, "file") {
-			f.addSkipped()
+			f.addContentSkipped()
 			continue
 		}
 		// Acquire a slot, or stop launching work once the context is cancelled
@@ -274,8 +376,7 @@ func (f *fetcher) fetchOneContent(ctx context.Context, csum string) error {
 	if err := os.MkdirAll(filepath.Dir(part), 0o755); err != nil {
 		return err
 	}
-	n, err := f.downloadResumable(ctx, objectRelPath(csum, "filez"), part)
-	if err != nil {
+	if _, err := f.downloadResumable(ctx, objectRelPath(csum, "filez"), part); err != nil {
 		return fmt.Errorf("download %s: %w", csum, err)
 	}
 
@@ -294,7 +395,7 @@ func (f *fetcher) fetchOneContent(ctx context.Context, csum string) error {
 		return err
 	}
 	os.Remove(part)
-	f.addContent(uint64(n))
+	f.addContent()
 	return nil
 }
 
@@ -327,7 +428,7 @@ func (f *fetcher) downloadResumable(ctx context.Context, relPath, part string) (
 	}
 	defer out.Close()
 
-	n, err := io.Copy(out, rc)
+	n, err := io.Copy(out, &progressReader{r: rc, f: f})
 	if err != nil {
 		return n, err // partial bytes are kept on disk for the next resume
 	}
@@ -351,19 +452,37 @@ func (f *fetcher) addMeta(n uint64) {
 	f.stats.MetaFetched++
 	f.stats.BytesDownloaded += n
 	f.mu.Unlock()
+	f.emit()
 }
 
-func (f *fetcher) addContent(n uint64) {
+// addContent records a completed content object. Its bytes were already counted
+// live through the wrapped download reader (addBytes), so only the count is
+// incremented here.
+func (f *fetcher) addContent() {
 	f.mu.Lock()
 	f.stats.ContentFetched++
-	f.stats.BytesDownloaded += n
+	f.contentDone++
 	f.mu.Unlock()
+	f.emit()
 }
 
+// addSkipped records a metadata object that is already present (resume). It does
+// not advance content-phase completion.
 func (f *fetcher) addSkipped() {
 	f.mu.Lock()
 	f.stats.ObjectsSkipped++
 	f.mu.Unlock()
+	f.emit()
+}
+
+// addContentSkipped records a content object already present on disk: it counts
+// as both a skipped object and a completed content-phase object.
+func (f *fetcher) addContentSkipped() {
+	f.mu.Lock()
+	f.stats.ObjectsSkipped++
+	f.contentDone++
+	f.mu.Unlock()
+	f.emit()
 }
 
 // csumSet is a small ordered, deduplicated set of checksums.

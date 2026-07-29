@@ -48,19 +48,25 @@ func (f *fetcher) tryDeltaPull(ctx context.Context, from, to string) (bool, erro
 	}
 	f.addMeta(uint64(len(sbData)))
 
+	// Downloading the delta parts: report progress as "part N of nParts".
+	f.mu.Lock()
+	f.curPhase = PhaseDelta
+	f.contentTotal = nParts
+	f.mu.Unlock()
+
 	for i := 0; i < nParts; i++ {
 		partRel := path.Join(rel, fmt.Sprintf("%d", i))
 		dst := filepath.Join(base, fmt.Sprintf("%d", i))
 		// Resumable download into a .part sidecar, then move into place.
 		partFile := dst + ".part"
-		n, err := f.downloadResumable(ctx, partRel, partFile)
+		_, err := f.downloadResumable(ctx, partRel, partFile)
 		if err != nil {
 			return false, fmt.Errorf("fetch delta part %d: %w", i, err)
 		}
 		if err := os.Rename(partFile, dst); err != nil {
 			return false, err
 		}
-		f.addContent(uint64(n))
+		f.addContent()
 	}
 
 	// Apply the delta locally (verifies part and produced-object checksums).
