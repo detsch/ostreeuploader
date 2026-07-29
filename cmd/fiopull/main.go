@@ -26,6 +26,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mattn/go-isatty"
+
 	"github.com/foundriesio/ostreeuploader/pkg/ostree"
 )
 
@@ -174,14 +176,25 @@ func cmdPull(args []string) int {
 
 	rc := ostree.RemoteConfig{BaseURL: rurl, Headers: headers}
 
-	res, err := ostree.OpenRepo(*repo).Pull(context.Background(), ostree.PullOptions{
+	opts := ostree.PullOptions{
 		Remote:      rc,
 		Ref:         ref,
 		Commit:      commit,
 		From:        *from,
 		NoDelta:     *noDelta,
 		Concurrency: *jobs,
-	})
+	}
+	// Render a progress bar only when stderr is a terminal; stay silent (summary
+	// only) otherwise, so machine callers and CI logs are not polluted with \r.
+	tty := isatty.IsTerminal(os.Stderr.Fd())
+	if tty {
+		opts.Progress = newTTYProgress()
+	}
+
+	res, err := ostree.OpenRepo(*repo).Pull(context.Background(), opts)
+	if tty {
+		finishTTYProgress()
+	}
 	if err != nil {
 		if errors.Is(err, ostree.ErrInsufficientStorage) {
 			fmt.Fprintln(os.Stderr, "INSUFFICIENT STORAGE:", err)
