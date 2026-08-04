@@ -155,6 +155,7 @@ func cmdPull(args []string) int {
 	from := fs.String("from", "", "current/base commit; enables the static-delta fast path")
 	noDelta := fs.Bool("no-delta", false, "force a full object pull (disable static deltas)")
 	jobs := fs.Int("jobs", 4, "concurrent content downloads")
+	progress := fs.String("progress", "auto", "progress reporting: auto (TTY bar, else silent), log (periodic lines to stderr, for non-interactive callers), none")
 	headers := headerFlags{}
 	fs.Var(headers, "header", "extra request header 'Key: Value' (repeatable)")
 	_ = fs.Parse(args)
@@ -184,16 +185,30 @@ func cmdPull(args []string) int {
 		NoDelta:     *noDelta,
 		Concurrency: *jobs,
 	}
-	// Render a progress bar only when stderr is a terminal; stay silent (summary
-	// only) otherwise, so machine callers and CI logs are not polluted with \r.
-	tty := isatty.IsTerminal(os.Stderr.Fd())
-	if tty {
-		opts.Progress = newTTYProgress()
+	// Select a progress reporter. "auto" renders a \r bar only when stderr is a
+	// terminal and is otherwise silent (so machine callers and CI logs are not
+	// polluted with \r); "log" emits periodic newline-terminated lines suitable
+	// for a non-interactive parent that captures stderr line by line (e.g.
+	// aktualizr-lite); "none" disables reporting.
+	var finish func()
+	switch *progress {
+	case "auto":
+		if isatty.IsTerminal(os.Stderr.Fd()) {
+			opts.Progress = newTTYProgress()
+			finish = finishTTYProgress
+		}
+	case "log":
+		opts.Progress = newLogProgress()
+	case "none":
+		// no reporting
+	default:
+		fmt.Fprintf(os.Stderr, "invalid --progress %q (want auto|log|none)\n", *progress)
+		return 2
 	}
 
 	res, err := ostree.OpenRepo(*repo).Pull(context.Background(), opts)
-	if tty {
-		finishTTYProgress()
+	if finish != nil {
+		finish()
 	}
 	if err != nil {
 		if errors.Is(err, ostree.ErrInsufficientStorage) {

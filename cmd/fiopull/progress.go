@@ -5,6 +5,8 @@ package main
 import (
 	"fmt"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/foundriesio/ostreeuploader/pkg/ostree"
 )
@@ -44,4 +46,43 @@ func newTTYProgress() ostree.ProgressFunc {
 // finishTTYProgress closes the progress line so subsequent output starts fresh.
 func finishTTYProgress() {
 	fmt.Fprintln(os.Stderr)
+}
+
+// newLogProgress returns a ProgressFunc that writes periodic, newline-terminated
+// progress lines to stderr, for a non-interactive parent (e.g. aktualizr-lite)
+// that captures the child's output line by line. Unlike the TTY bar it emits no
+// \r, so it is safe to log. Output is throttled to at most one line per second,
+// but a phase change or the final done==total snapshot always prints, so the
+// last line for each phase reports completion. The callback may be invoked
+// concurrently, so emission is serialized under a mutex.
+func newLogProgress() ostree.ProgressFunc {
+	const minInterval = time.Second
+	var (
+		mu        sync.Mutex
+		lastAt    time.Time
+		lastPhase ostree.PullPhase
+		started   bool
+	)
+	return func(p ostree.PullProgress) {
+		mu.Lock()
+		defer mu.Unlock()
+		now := time.Now()
+		done := p.ObjectsTotal > 0 && p.ObjectsDone >= p.ObjectsTotal
+		phaseChanged := !started || p.Phase != lastPhase
+		if !phaseChanged && !done && now.Sub(lastAt) < minInterval {
+			return
+		}
+		started = true
+		lastPhase = p.Phase
+		lastAt = now
+
+		if p.ObjectsTotal > 0 {
+			pct := p.ObjectsDone * 100 / p.ObjectsTotal
+			fmt.Fprintf(os.Stderr, "fiopull: %s %d/%d (%d%%) %s\n",
+				p.Phase, p.ObjectsDone, p.ObjectsTotal, pct, ostree.FormatBytes(p.BytesDownloaded))
+		} else {
+			fmt.Fprintf(os.Stderr, "fiopull: %s %d objects %s\n",
+				p.Phase, p.ObjectsDone, ostree.FormatBytes(p.BytesDownloaded))
+		}
+	}
 }
