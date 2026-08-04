@@ -67,11 +67,25 @@ Exit codes: `0` ok, `1` error, `2` usage, `3` insufficient storage, `4` size
 unavailable.
 
 The `ostree.sizes` metadata path only works if the factory's ostree commits were
-built with `ostree commit --generate-sizes`. For LmP-based factories this is
-controlled by the OSTree commit step of the image build in your
-`meta-subscriber-overrides` layer (or your own Yocto CI); enable it there so the
-commits your factory publishes carry the sizes table. Without it (and without a
-published static delta) `update-size` cannot estimate a size and exits 4.
+built with `ostree commit --generate-sizes`. For LmP-based factories the flags
+passed to `ostree commit` come from the `EXTRA_OSTREE_COMMIT` variable in
+meta-updater's `image_types_ostree.bbclass`, so enable it by appending
+`--generate-sizes` to that variable from your `meta-subscriber-overrides` layer
+(the layer intended for factory customization).
+
+For example, add a file such as
+`meta-subscriber-overrides/recipes-samples/images/lmp-factory-image.bbappend`
+(or your image recipe's `.bbappend`) containing:
+
+```
+EXTRA_OSTREE_COMMIT:append = " --generate-sizes"
+```
+
+The leading space matters — `EXTRA_OSTREE_COMMIT` is inserted verbatim as the
+final argument of the `ostree commit` invocation. After a factory image build,
+the commits your factory publishes will carry the `ostree.sizes` table. To turn
+it off again, drop the `.bbappend`. Without it (and without a published static
+delta) `update-size` cannot estimate a size and exits 4.
 
 ##### pull
 Pulls a commit (and every object it references) into a local bare-user repo. The
@@ -79,10 +93,14 @@ pull is delta-aware and resumable: pass `--from` to use the from→target static
 delta when the remote publishes one (falling back to a full object pull), and
 re-running resumes an interrupted pull.
 ```
-./bin/fiopull pull [--from <CSUM>] [--no-delta] [--jobs <N>] --repo <local-repo> <URL> <COMMIT | REF>
+./bin/fiopull pull [--from <CSUM>] [--no-delta] [--jobs <N>] [--progress auto|log|none] --repo <local-repo> <URL> <COMMIT | REF>
 ```
 `URL` and the target `COMMIT` (a 64-char hex checksum) or `REF` (e.g. `main`,
 resolved against the remote) are mandatory positional arguments and must come
 after any flags. `--no-delta` forces a full object pull; `--jobs` bounds
-concurrent content downloads.
+concurrent content downloads. `--progress` selects progress reporting: `auto`
+(default) draws a live bar when stderr is a terminal and is otherwise silent;
+`log` emits periodic newline-terminated lines to stderr (no carriage returns),
+for a non-interactive parent such as aktualizr-lite that captures the output;
+`none` disables it.
 
